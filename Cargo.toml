@@ -1,0 +1,9 @@
+[package]
+name = "brainscan"
+version = "0.1.0"
+edition = "2024"
+description = "TUI to browse the files that drive LLM agents in a repo"
+
+[dependencies]
+ignore = "0.4"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
