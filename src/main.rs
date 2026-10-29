@@ -8,10 +8,13 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style, Stylize};
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
 
 use discover::{Found, discover};
 
@@ -21,7 +24,9 @@ struct App {
     /// One per list row: None for a group header, Some(index into files) for a file.
     rows: Vec<Option<usize>>,
     list: ListState,
-    content: String,
+    content: Text<'static>,
+    syntaxes: SyntaxSet,
+    theme: Theme,
     scroll: u16,
     /// Preview height and wrapped line count from the last draw, for paging and clamping.
     page: u16,
@@ -47,7 +52,9 @@ impl App {
             files,
             rows,
             list: ListState::default(),
-            content: String::new(),
+            content: Text::default(),
+            syntaxes: SyntaxSet::load_defaults_newlines(),
+            theme: ThemeSet::load_defaults().themes.remove("base16-ocean.dark").unwrap(),
             scroll: 0,
             page: 0,
             lines: 0,
@@ -69,9 +76,10 @@ impl App {
 
     fn reload(&mut self) {
         let Some(path) = self.selected().map(|f| self.root.join(&f.path)) else { return };
-        self.content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| format!("<cannot read {}: {e}>", path.display()))
-            .replace('\t', "    ");
+        self.content = match std::fs::read_to_string(&path) {
+            Ok(s) => highlight(&s.replace('\t', "    "), &path, &self.syntaxes, &self.theme),
+            Err(e) => Text::raw(format!("<cannot read {}: {e}>", path.display())),
+        };
         self.scroll = 0;
     }
 
@@ -133,7 +141,7 @@ impl App {
         self.list_page = left.height.saturating_sub(2);
 
         let title = self.selected().map(|f| format!(" {} ", f.path.display())).unwrap_or_default();
-        let preview = Paragraph::new(self.content.as_str()).wrap(Wrap { trim: false });
+        let preview = Paragraph::new(self.content.clone()).wrap(Wrap { trim: false });
         let inner_width = right.width.saturating_sub(2);
         self.lines = preview.line_count(inner_width).min(u16::MAX as usize) as u16;
         self.page = right.height.saturating_sub(2);
@@ -190,9 +198,41 @@ impl App {
     }
 }
 
+/// Colors `src` by the syntax matching `path`'s extension, keeping the terminal's own background.
+fn highlight(src: &str, path: &std::path::Path, syntaxes: &SyntaxSet, theme: &Theme) -> Text<'static> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let syntax = syntaxes.find_syntax_by_extension(ext).unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+    let mut h = HighlightLines::new(syntax, theme);
+    syntect::util::LinesWithEndings::from(src)
+        .map(|line| match h.highlight_line(line, syntaxes) {
+            Ok(regions) => Line::from_iter(regions.into_iter().map(|(style, text)| {
+                let c = style.foreground;
+                Span::styled(text.trim_end_matches(['\r', '\n']).to_string(), Style::new().fg(Color::Rgb(c.r, c.g, c.b)))
+            })),
+            Err(_) => Line::raw(line.trim_end_matches(['\r', '\n']).to_string()),
+        })
+        .collect()
+}
+
 fn main() -> io::Result<()> {
     let root = std::env::args().nth(1).unwrap_or_else(|| ".".into());
     let root = std::fs::canonicalize(&root).map_err(|e| io::Error::new(e.kind(), format!("{root}: {e}")))?;
     let app = App::new(root);
     ratatui::run(|terminal| app.run(terminal))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn highlight_keeps_lines_and_colors_by_extension() {
+        let (syntaxes, theme) = (SyntaxSet::load_defaults_newlines(), ThemeSet::load_defaults().themes.remove("base16-ocean.dark").unwrap());
+        let md = highlight("# Title\r\nbody\n", std::path::Path::new("x.md"), &syntaxes, &theme);
+        assert_eq!(md.lines.len(), 2);
+        assert_eq!(md.lines[0].to_string(), "# Title");
+        assert!(md.lines[0].spans.iter().all(|s| matches!(s.style.fg, Some(Color::Rgb(..)))));
+        let unknown = highlight("a\nb", std::path::Path::new("x.unknownext"), &syntaxes, &theme);
+        assert_eq!(unknown.lines.len(), 2);
+    }
 }
